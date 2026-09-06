@@ -97,6 +97,11 @@ so the closest one is picked by circular hue distance against the theme's accent
 near-grey accent falls back to the neutral wash. RGUI is the one menu driver that
 accepts arbitrary colours, so it gets an exact-hex palette file.
 
+A theme is free to write its palette as `rgb()` or a named colour. Those still drive
+the icons and the background, but RetroArch's own colour keys take integers only, so
+they are left at their defaults rather than written as something malformed — the run
+says so when it happens.
+
 **Assets.** `assets_directory` is pointed at `~/.config/retroarch/assets-omarchy`, a
 symlink farm over the packaged assets. You keep getting asset updates from your package
 manager; we just own one extra icon set beside them. Real directories are never

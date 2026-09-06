@@ -49,7 +49,18 @@ RESTORE=0
 
 while (($# > 0)); do
   case "$1" in
-    --theme) THEME_NAME="${2:-}"; shift 2 ;;
+    --theme)
+      # Guard the value: a bare `--theme` used to shift past the end of the
+      # argument list, which left $# unchanged and spun forever.
+      [[ $# -ge 2 && -n ${2:-} ]] || { echo "--theme needs a theme name" >&2; exit 1; }
+      THEME_NAME="$2"
+      shift 2
+      ;;
+    --theme=*)
+      THEME_NAME="${1#*=}"
+      [[ -n $THEME_NAME ]] || { echo "--theme needs a theme name" >&2; exit 1; }
+      shift
+      ;;
     --force) FORCE=1; shift ;;
     --quiet) QUIET=1; shift ;;
     --restore) RESTORE=1; shift ;;
@@ -62,6 +73,41 @@ done
 
 log() { ((QUIET)) || echo "$@"; }
 die() { echo "omarchy-retroarch-theme: $*" >&2; exit 1; }
+
+# Normalise #rgb / #rrggbb / rrggbb to bare lowercase rrggbb. Fails on anything
+# else — a theme is free to use rgb() or a named colour, which ImageMagick
+# understands but RetroArch's integer colour keys do not.
+norm_hex() {
+  local h="${1#\#}"
+  h="${h,,}"
+  if [[ $h =~ ^[0-9a-f]{3}$ ]]; then
+    h="${h:0:1}${h:0:1}${h:1:1}${h:1:1}${h:2:1}${h:2:1}"
+  fi
+  [[ $h =~ ^[0-9a-f]{6}$ ]] || return 1
+  printf '%s' "$h"
+}
+
+# Whether a colour is safe to hand to ImageMagick. Omarchy derives shades by
+# mixing hex, so a theme written in rgb() can hand us values like
+# "#fffffffffffffff8580c" — which ImageMagick accepts for a 1x1 canvas but then
+# fails on in a real composite, so the shape is checked before the probe.
+color_ok() {
+  local c="${1:-}"
+  [[ -n $c ]] || return 1
+  if [[ $c == \#* ]]; then
+    norm_hex "$c" >/dev/null || return 1
+  elif [[ ! $c =~ ^(rgba?|hsla?)\([0-9.,%\ /-]+\)$ ]] && [[ ! $c =~ ^[A-Za-z][A-Za-z0-9]*$ ]]; then
+    return 1
+  fi
+  magick -size 1x1 xc:"$c" null: >/dev/null 2>&1
+}
+
+# First argument ImageMagick accepts, else the last one.
+first_usable_color() {
+  local c
+  for c in "$@"; do color_ok "$c" && { printf '%s' "$c"; return 0; }; done
+  printf '%s' "${*: -1}"
+}
 
 # Two `omarchy theme set` calls in quick succession would otherwise have their
 # hooks racing over the same icon directory.
@@ -107,6 +153,9 @@ set_cfg() {
   if grep -q "^${key} = " "$RA_CFG"; then
     sed -i "s|^${key} = .*|${key} = \"${escaped}\"|" "$RA_CFG"
   else
+    # A config whose last line has no newline would otherwise get the new key
+    # glued onto it, corrupting both settings.
+    [[ -s $RA_CFG && $(tail -c1 "$RA_CFG" | wc -l) -eq 0 ]] && printf '\n' >>"$RA_CFG"
     printf '%s = "%s"\n' "$key" "$val" >>"$RA_CFG"
   fi
 }
@@ -192,12 +241,14 @@ MODE=$(color mode)
 if [[ $MODE == light ]]; then
   # On a light wash the plain foreground is the only tint with enough contrast;
   # dark_foreground resolves to a mid grey in most light themes.
-  ICON_TINT="$FOREGROUND"
-  SCRIM=$(color background)
+  ICON_TINT=$(first_usable_color "$FOREGROUND" black)
+  SCRIM=$(first_usable_color "$BACKGROUND" white)
 else
-  ICON_TINT=$(color light_foreground foreground)
-  SCRIM=$(color darker_background background)
+  ICON_TINT=$(first_usable_color "$(color light_foreground foreground)" "$FOREGROUND" white)
+  SCRIM=$(first_usable_color "$(color darker_background background)" "$BACKGROUND" black)
 fi
+WASH=$(first_usable_color "$BACKGROUND" "$SCRIM")
+MARK=$(first_usable_color "$ACCENT" "$ICON_TINT")
 
 log "󰊗 Theming RetroArch as '$THEME_NAME' ($MODE)  accent $ACCENT  icons $ICON_TINT"
 
@@ -362,11 +413,19 @@ build_wallpaper() {
 
 if build_wallpaper; then
   log "  background: $(basename "$SRC_BG") + scrim + wordmark"
-else
+elif magick -size "${SCREEN_W}x${SCREEN_H}" gradient:"$WASH-$SCRIM" "$WALLPAPER" 2>/dev/null &&
+  [[ -s $WALLPAPER ]]; then
   # No usable image: a flat wash in the theme's own background colours.
-  magick -size "${SCREEN_W}x${SCREEN_H}" gradient:"$BACKGROUND-$SCRIM" "$WALLPAPER" 2>/dev/null ||
-    die "ImageMagick could not generate a background"
   log "  background: generated gradient"
+elif magick -size "${SCREEN_W}x${SCREEN_H}" xc:"$WASH" "$WALLPAPER" 2>/dev/null &&
+  [[ -s $WALLPAPER ]]; then
+  log "  background: solid fill"
+else
+  # Everything else about the theme still works, so leave RetroArch's own
+  # background alone rather than pointing it at a file we could not write.
+  rm -f "$WALLPAPER"
+  WALLPAPER=""
+  log "  background: could not be generated — leaving RetroArch's alone"
 fi
 
 # ------------------------------------------------------------------ icons ---
@@ -387,7 +446,7 @@ if ((FORCE)) || [[ $(cat "$STAMP" 2>/dev/null) != "$ICON_TINT|$ACCENT|$ICON_STYL
   # Main menu tab: Omarchy's logomark in the accent colour.
   if [[ -f $LOGO_MARK ]]; then
     magick "$LOGO_MARK" -trim +repage -resize 200x140 \
-      -fill "$ACCENT" -colorize 100 \
+      -fill "$MARK" -colorize 100 \
       -background none -gravity center -extent 256x256 \
       "$CUSTOM_ICONS/retroarch.png" 2>/dev/null
   fi
@@ -399,18 +458,24 @@ fi
 # -------------------------------------------------------------- rgui theme ---
 
 # RGUI is the one menu driver that takes exact colours, so it gets the palette
-# verbatim rather than a nearest match.
-argb() { local hex="${2#\#}"; printf '0x%s%s\n' "$1" "${hex,,}"; }
+# verbatim rather than a nearest match. A colour the palette expresses in a form
+# RetroArch cannot read is skipped, leaving RetroArch's own default for that key,
+# rather than writing a malformed value.
+rgui_line() {
+  local key="$1" alpha="$2" hex
+  hex=$(norm_hex "${3:-}") || return 0
+  printf '%s = "0x%s%s"\n' "$key" "$alpha" "$hex"
+}
 {
-  echo "rgui_entry_normal_color = \"$(argb ff "$FOREGROUND")\""
-  echo "rgui_entry_hover_color = \"$(argb ff "$ACCENT")\""
-  echo "rgui_title_color = \"$(argb ff "$ACCENT")\""
-  echo "rgui_bg_dark_color = \"$(argb f0 "$(color darker_background background)")\""
-  echo "rgui_bg_light_color = \"$(argb f0 "$BACKGROUND")\""
-  echo "rgui_border_dark_color = \"$(argb ff "$(color selection)")\""
-  echo "rgui_border_light_color = \"$(argb ff "$(color muted)")\""
-  echo "rgui_shadow_color = \"$(argb c0 '#000000')\""
-  echo "rgui_particle_color = \"$(argb 40 "$ACCENT")\""
+  rgui_line rgui_entry_normal_color ff "$FOREGROUND"
+  rgui_line rgui_entry_hover_color ff "$ACCENT"
+  rgui_line rgui_title_color ff "$ACCENT"
+  rgui_line rgui_bg_dark_color f0 "$(color darker_background background)"
+  rgui_line rgui_bg_light_color f0 "$BACKGROUND"
+  rgui_line rgui_border_dark_color ff "$(color selection)"
+  rgui_line rgui_border_light_color ff "$(color muted)"
+  rgui_line rgui_shadow_color c0 "#000000"
+  rgui_line rgui_particle_color 40 "$ACCENT"
 } >"$OMA_DIR/omarchy-rgui.cfg"
 
 # ----------------------------------------------------------------- config ---
@@ -423,8 +488,7 @@ warn_if_running
 FONT_TTF=$(fc-match -f '%{file}' "$(omarchy-font-current 2>/dev/null || echo monospace)" 2>/dev/null)
 [[ -f $FONT_TTF ]] || FONT_TTF=$(fc-match -f '%{file}' monospace 2>/dev/null)
 
-fg_hex="${FOREGROUND#\#}"
-FR=$((16#${fg_hex:0:2})) FG_=$((16#${fg_hex:2:2})) FB=$((16#${fg_hex:4:2}))
+fg_hex=$(norm_hex "$FOREGROUND") || fg_hex=""
 
 set_cfg assets_directory "$UASSETS"
 set_cfg menu_driver "xmb"
@@ -432,13 +496,19 @@ set_cfg xmb_theme 6                      # XMB_ICON_THEME_CUSTOM
 set_cfg xmb_menu_color_theme "$XMB_COLOR_IDX"
 set_cfg menu_shader_pipeline "$SHADER_PIPELINE"
 set_cfg xmb_alpha_factor 75
-set_cfg menu_wallpaper "$WALLPAPER"
-set_cfg menu_wallpaper_opacity "1.000000"
+[[ -n $WALLPAPER ]] && {
+  set_cfg menu_wallpaper "$WALLPAPER"
+  set_cfg menu_wallpaper_opacity "1.000000"
+}
 set_cfg menu_dynamic_wallpaper_enable "false"
 [[ -f $FONT_TTF ]] && { set_cfg xmb_font "$FONT_TTF"; set_cfg video_font_path "$FONT_TTF"; }
-set_cfg menu_font_color_red "$FR"
-set_cfg menu_font_color_green "$FG_"
-set_cfg menu_font_color_blue "$FB"
+if [[ -n $fg_hex ]]; then
+  set_cfg menu_font_color_red "$((16#${fg_hex:0:2}))"
+  set_cfg menu_font_color_green "$((16#${fg_hex:2:2}))"
+  set_cfg menu_font_color_blue "$((16#${fg_hex:4:2}))"
+else
+  log "  note: foreground '$FOREGROUND' is not a hex colour — leaving menu font colour alone"
+fi
 set_cfg xmb_shadows_enable "true"
 set_cfg rgui_menu_color_theme 0          # RGUI_THEME_CUSTOM
 set_cfg rgui_menu_theme_preset "$OMA_DIR/omarchy-rgui.cfg"
