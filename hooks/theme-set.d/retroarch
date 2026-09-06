@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Re-theme RetroArch whenever the Omarchy theme changes.
+# Runs after the current-theme symlinks are updated, so it reads them directly
+# instead of trusting $1. Backgrounded: retinting ~850 icons takes a moment and
+# nothing else should wait on it.
+
+command -v omarchy-retroarch-theme >/dev/null || exit 0
+
+omarchy-retroarch-theme --quiet >/dev/null 2>&1 &
+disown

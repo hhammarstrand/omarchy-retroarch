@@ -1,0 +1,9 @@
+#!/bin/bash
+
+# Point RetroArch's menu font at the new Omarchy font.
+# The palette work is cached, so this run only rewrites the config.
+
+command -v omarchy-retroarch-theme >/dev/null || exit 0
+
+omarchy-retroarch-theme --quiet >/dev/null 2>&1 &
+disown

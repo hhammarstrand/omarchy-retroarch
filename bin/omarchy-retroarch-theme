@@ -1,0 +1,446 @@
+#!/bin/bash
+
+# omarchy:summary=Re-theme RetroArch from the current Omarchy theme
+# omarchy:group=retroarch
+# omarchy:args=[--theme <name>] [--force] [--restore] [--quiet]
+# omarchy:examples=omarchy-retroarch-theme | omarchy-retroarch-theme --theme nord
+
+# omarchy-retroarch-theme — dress RetroArch in the current Omarchy theme.
+#
+# Generates, from the active Omarchy palette:
+#   - a menu background built from your desktop wallpaper (scrim + Omarchy wordmark)
+#   - a full XMB icon set tinted in the theme's foreground colour
+#   - the Omarchy logomark as the main menu icon, in the theme's accent colour
+#   - exact menu font colours, and an exact-hex RGUI palette
+#   - the closest built-in XMB gradient, matched by hue against the accent
+#
+# Usage:
+#   omarchy-retroarch-theme                  # follow the current Omarchy theme
+#   omarchy-retroarch-theme --theme nord     # preview another theme (desktop untouched)
+#   omarchy-retroarch-theme --force          # rebuild icons even if the tint is unchanged
+#   omarchy-retroarch-theme --restore        # put RetroArch's own config back
+#
+# Installed as an omarchy theme-set/font-set hook, this runs on every
+# `omarchy theme set` and `omarchy font set`.
+#
+# Environment:
+#   RETROARCH_CONFIG_DIR   override RetroArch config discovery
+#   OMARCHY_RETROARCH_ICONS   line (default) | solid
+#   OMARCHY_RETROARCH_SHADER  XMB shader pipeline index (default 0, none)
+
+set -uo pipefail
+
+VERSION="1.0.0"
+
+STATE="$HOME/.local/state/omarchy/current"
+OMARCHY_SHARE="${OMARCHY_PATH:-/usr/share/omarchy}"
+LOGO_SVG="$OMARCHY_SHARE/logo.svg"
+LOGO_MARK="$OMARCHY_SHARE/default/plymouth/logos/oma.png"
+
+# solid = filled glyphs/badges (monochrome set), line = hairline outlines (automatic set)
+ICON_STYLE="${OMARCHY_RETROARCH_ICONS:-line}"
+SHADER_PIPELINE="${OMARCHY_RETROARCH_SHADER:-0}"
+
+THEME_NAME=""
+THEME_PREVIEW=0
+FORCE=0
+QUIET=0
+RESTORE=0
+
+while (($# > 0)); do
+  case "$1" in
+    --theme) THEME_NAME="${2:-}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    --restore) RESTORE=1; shift ;;
+    --version) echo "omarchy-retroarch-theme $VERSION"; exit 0 ;;
+    -h | --help) sed -n '8,30p' "$0" | sed 's/^# \?//;s/^#$//'; exit 0 ;;
+    -*) echo "unknown option: $1" >&2; exit 1 ;;
+    *) THEME_NAME="$1"; shift ;;
+  esac
+done
+
+log() { ((QUIET)) || echo "$@"; }
+die() { echo "omarchy-retroarch-theme: $*" >&2; exit 1; }
+
+# Two `omarchy theme set` calls in quick succession would otherwise have their
+# hooks racing over the same icon directory.
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/omarchy-retroarch-theme.lock"
+flock 9
+
+# ----------------------------------------------------------- dependencies ---
+
+missing=()
+for dep in magick python3 fc-match; do
+  command -v "$dep" >/dev/null || missing+=("$dep")
+done
+((${#missing[@]} == 0)) || die "missing dependencies: ${missing[*]} (need imagemagick, python, fontconfig)"
+
+# ------------------------------------------------------------- retroarch ---
+
+find_ra_dir() {
+  local d
+  for d in "${RETROARCH_CONFIG_DIR:-}" \
+    "$HOME/.config/retroarch" \
+    "$HOME/.var/app/org.libretro.RetroArch/config/retroarch"; do
+    [[ -n $d && -f $d/retroarch.cfg ]] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+RA_DIR=$(find_ra_dir) || die "no retroarch.cfg found — launch RetroArch once, or set RETROARCH_CONFIG_DIR"
+RA_CFG="$RA_DIR/retroarch.cfg"
+UASSETS="$RA_DIR/assets-omarchy"
+OMA_DIR="$UASSETS/omarchy"
+CUSTOM_ICONS="$UASSETS/xmb/custom/png"
+BACKUP="$RA_DIR/retroarch.cfg.pre-omarchy"
+
+cfg_get() { sed -n "s|^$1 = \"\(.*\)\"$|\1|p" "$RA_CFG" | tail -1; }
+
+set_cfg() {
+  local key="$1" val="$2" escaped
+  # The value lands in a sed replacement, so a home directory containing & or |
+  # would otherwise corrupt the line.
+  escaped=${val//\\/\\\\}
+  escaped=${escaped//|/\\|}
+  escaped=${escaped//&/\\&}
+  if grep -q "^${key} = " "$RA_CFG"; then
+    sed -i "s|^${key} = .*|${key} = \"${escaped}\"|" "$RA_CFG"
+  else
+    printf '%s = "%s"\n' "$key" "$val" >>"$RA_CFG"
+  fi
+}
+
+# RetroArch rewrites its whole config on exit, so anything written underneath a
+# running instance is lost.
+warn_if_running() {
+  pgrep -x retroarch >/dev/null || return 0
+  echo "omarchy-retroarch-theme: RetroArch is running and will overwrite this on exit." >&2
+  echo "                         Close it and re-run, or just restart it afterwards." >&2
+}
+
+# ---------------------------------------------------------------- restore ---
+
+if ((RESTORE)); then
+  warn_if_running
+  [[ -f $BACKUP ]] || die "no backup at $BACKUP"
+  cp -f "$BACKUP" "$RA_CFG"
+  rm -rf "$UASSETS"
+  log "Restored $RA_CFG from $BACKUP and removed $UASSETS"
+  exit 0
+fi
+
+# ------------------------------------------------------------- xmb assets ---
+
+# The stock icon sets we tint. RetroArch ships them wherever the packager put
+# them, and once we have run our own tree is a symlink farm pointing back.
+find_sys_assets() {
+  local link real d cfg_dir
+  link="$UASSETS/xmb/monochrome"
+  if [[ -L $link ]]; then
+    real=$(readlink -f "$link")
+    [[ -d $real ]] && { dirname "$(dirname "$real")"; return 0; }
+  fi
+  cfg_dir=$(cfg_get assets_directory)
+  cfg_dir="${cfg_dir/#\~/$HOME}"
+  if [[ -n $cfg_dir && $cfg_dir != "$UASSETS" && -d $cfg_dir/xmb/monochrome ]]; then
+    echo "$cfg_dir"
+    return 0
+  fi
+  for d in /usr/share/retroarch/assets /usr/local/share/retroarch/assets \
+    /app/share/retroarch/assets "$HOME/.local/share/retroarch/assets" \
+    "$RA_DIR/assets"; do
+    [[ -d $d/xmb/monochrome ]] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+SYS_ASSETS=$(find_sys_assets) ||
+  die "no XMB assets found — install them (Arch: retroarch-assets-xmb) or use RetroArch's Online Updater"
+ICON_SRC="$SYS_ASSETS/xmb/monochrome/png"
+ICON_SRC_LINE="$SYS_ASSETS/xmb/automatic/png"
+[[ -d $ICON_SRC ]] || die "incomplete XMB assets at $SYS_ASSETS (no monochrome set)"
+
+# ---------------------------------------------------------------- palette ---
+
+command -v omarchy-theme-color >/dev/null || die "omarchy-theme-color not found — this needs Omarchy"
+
+if [[ -n $THEME_NAME ]]; then
+  THEME_DIR=$(omarchy-theme-dir "$THEME_NAME" 2>/dev/null)
+  [[ -d $THEME_DIR ]] || die "unknown theme: $THEME_NAME"
+  # Previewing a theme that isn't active: take its own background too, rather
+  # than whatever the desktop happens to be showing.
+  [[ $THEME_NAME == "$(cat "$STATE/theme.name" 2>/dev/null)" ]] || THEME_PREVIEW=1
+else
+  THEME_DIR="$STATE/theme"
+  THEME_NAME=$(cat "$STATE/theme.name" 2>/dev/null || echo unknown)
+fi
+COLORS_FILE="$THEME_DIR/colors.toml"
+[[ -f $COLORS_FILE ]] || die "no colors.toml in $THEME_DIR"
+
+# Resolve through Omarchy's own parser, so third-party themes that only define
+# ANSI colours still produce a full palette.
+color() { omarchy-theme-color --file "$COLORS_FILE" "$1" "${2:-}" 2>/dev/null; }
+
+ACCENT=$(color accent)
+FOREGROUND=$(color foreground)
+BACKGROUND=$(color background)
+MODE=$(color mode)
+[[ -n $ACCENT && -n $FOREGROUND && -n $BACKGROUND ]] ||
+  die "could not resolve a palette from $COLORS_FILE"
+
+if [[ $MODE == light ]]; then
+  # On a light wash the plain foreground is the only tint with enough contrast;
+  # dark_foreground resolves to a mid grey in most light themes.
+  ICON_TINT="$FOREGROUND"
+  SCRIM=$(color background)
+else
+  ICON_TINT=$(color light_foreground foreground)
+  SCRIM=$(color darker_background background)
+fi
+
+log "󰊗 Theming RetroArch as '$THEME_NAME' ($MODE)  accent $ACCENT  icons $ICON_TINT"
+
+# --------------------------------------------------- closest XMB gradient ---
+
+# RetroArch's built-in XMB gradients (menu/drivers/xmb.c) with their enum index
+# from menu/menu_defines.h. Pick the one whose hue sits closest to the theme's
+# accent, so every Omarchy theme lands on a sane background wash.
+nearest_color_theme() {
+  python3 - "$ACCENT" "$MODE" <<'PY'
+import colorsys, sys
+
+accent, mode = sys.argv[1], sys.argv[2]
+
+PRESETS = {
+    0:  (190, 80, 69),      # legacy red
+    1:  (148, 90, 148),     # dark purple
+    2:  (44, 62, 80),       # midnight blue
+    3:  (205, 174, 84),     # golden
+    4:  (3, 162, 254),      # electric blue
+    5:  (102, 134, 58),     # apple green
+    6:  (69, 125, 140),     # undersea
+    7:  (255, 25, 0),       # volcanic red
+    11: (135, 206, 250),    # morning blue
+    12: (30, 72, 114),      # sunbeam
+    13: (146, 232, 66),     # lime
+    14: (254, 221, 3),      # pikachu yellow
+    15: (107, 92, 177),     # gamecube purple
+    16: (148, 10, 36),      # famicom red
+    17: (236, 97, 76),      # flaming hot
+    18: (29, 164, 255),     # ice cold
+}
+NAMES = {
+    0: "legacy-red", 1: "dark-purple", 2: "midnight-blue", 3: "golden",
+    4: "electric-blue", 5: "apple-green", 6: "undersea", 7: "volcanic-red",
+    8: "dark", 9: "light", 11: "morning-blue", 12: "sunbeam", 13: "lime",
+    14: "pikachu-yellow", 15: "gamecube-purple", 16: "famicom-red",
+    17: "flaming-hot", 18: "ice-cold",
+}
+NEUTRAL = 9 if mode == "light" else 8
+
+def rgb(h):
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+try:
+    ar, ag, ab = rgb(accent)
+except Exception:
+    print(f"{NEUTRAL} {NAMES[NEUTRAL]}")
+    raise SystemExit
+
+ah, al, asat = colorsys.rgb_to_hls(ar / 255, ag / 255, ab / 255)
+
+# A near-grey accent has no hue worth matching: use the neutral wash.
+if asat < 0.12:
+    print(f"{NEUTRAL} {NAMES[NEUTRAL]}")
+    raise SystemExit
+
+best, best_d = NEUTRAL, 1e9
+for idx, prgb in PRESETS.items():
+    ph, pl, ps = colorsys.rgb_to_hls(*[c / 255 for c in prgb])
+    dh = abs(ah - ph)
+    dh = min(dh, 1 - dh) * 2                # circular hue distance, 0..1
+    d = dh * 3.0 + abs(asat - ps) * 0.8 + abs(al - pl) * 0.5
+    if d < best_d:
+        best, best_d = idx, d
+
+print(f"{best} {NAMES[best]}")
+PY
+}
+
+read -r XMB_COLOR_IDX XMB_COLOR_NAME < <(nearest_color_theme)
+XMB_COLOR_IDX=${XMB_COLOR_IDX:-8}
+log "  gradient: ${XMB_COLOR_NAME:-dark} (#$XMB_COLOR_IDX)"
+
+# ------------------------------------------------------------- asset tree ---
+
+# A symlink farm over the packaged assets, so RetroArch keeps getting asset
+# updates from the package manager while we own one extra icon set beside them.
+mkdir -p "$UASSETS/xmb" "$OMA_DIR" "$CUSTOM_ICONS" || die "cannot write to $UASSETS"
+link_assets() {
+  local entry name target
+  for entry in "$1"/*; do
+    [[ -e $entry ]] || continue
+    name=$(basename "$entry")
+    [[ $name == xmb || $name == custom ]] && continue
+    target="$2/$name"
+    # Never clobber real content (e.g. assets pulled in by RetroArch's updater).
+    [[ -e $target && ! -L $target ]] && continue
+    ln -sfn "$entry" "$target"
+  done
+}
+link_assets "$SYS_ASSETS" "$UASSETS"
+link_assets "$SYS_ASSETS/xmb" "$UASSETS/xmb"
+[[ -f $SYS_ASSETS/xmb/monochrome/font.ttf ]] &&
+  ln -sfn "$SYS_ASSETS/xmb/monochrome/font.ttf" "$UASSETS/xmb/custom/font.ttf"
+
+# -------------------------------------------------------------- wallpaper ---
+
+read -r SCREEN_W SCREEN_H < <(
+  {
+    hyprctl monitors -j 2>/dev/null |
+      python3 -c 'import json,sys
+m = json.load(sys.stdin)
+print(max(x["width"] for x in m), max(x["height"] for x in m))' 2>/dev/null
+  } || echo "2560 1440"
+)
+[[ ${SCREEN_W:-0} -gt 0 && ${SCREEN_H:-0} -gt 0 ]] || { SCREEN_W=2560; SCREEN_H=1440; }
+
+pick_background() {
+  local bg
+  if ((THEME_PREVIEW == 0)) && [[ -L $STATE/background ]]; then
+    bg=$(readlink -f "$STATE/background")
+    [[ -f $bg ]] && { echo "$bg"; return; }
+  fi
+  # Prefer a photographic background over the flat branded one.
+  bg=$(find "$THEME_DIR/backgrounds" -maxdepth 1 -type f \
+    \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) \
+    ! -name 'omarchy.png' 2>/dev/null | sort | head -1)
+  [[ -n $bg ]] || bg=$(find "$THEME_DIR/backgrounds" -maxdepth 1 -type f 2>/dev/null | sort | head -1)
+  echo "$bg"
+}
+
+SRC_BG=$(pick_background)
+WALLPAPER="$OMA_DIR/menu-background.png"
+WORDMARK="$OMA_DIR/.wordmark.png"
+
+build_wallpaper() {
+  [[ -f $SRC_BG ]] || return 1
+
+  if [[ -f $LOGO_SVG ]]; then
+    magick -background none "$LOGO_SVG" -resize $((SCREEN_W / 7))x \
+      -fill "$ICON_TINT" -colorize 100 \
+      -alpha set -channel A -evaluate multiply 0.20 +channel \
+      "$WORDMARK" 2>/dev/null || rm -f "$WORDMARK"
+  fi
+
+  # Wash the photo toward the theme's own background, then fall off along the
+  # vertical so the menu column keeps its contrast: darker in dark themes,
+  # lighter in light ones.
+  if [[ $MODE == light ]]; then
+    magick "$SRC_BG" -resize "${SCREEN_W}x${SCREEN_H}^" -gravity center -extent "${SCREEN_W}x${SCREEN_H}" \
+      \( -size "${SCREEN_W}x${SCREEN_H}" xc:"$SCRIM" \) -compose blend -define compose:args=46 -composite \
+      \( -size "${SCREEN_H}x${SCREEN_W}" gradient:"gray8-gray28" -rotate 90 \) -compose screen -composite \
+      -modulate 100,96,100 "$WALLPAPER" 2>/dev/null || return 1
+  else
+    magick "$SRC_BG" -resize "${SCREEN_W}x${SCREEN_H}^" -gravity center -extent "${SCREEN_W}x${SCREEN_H}" \
+      \( -size "${SCREEN_W}x${SCREEN_H}" xc:"$SCRIM" \) -compose blend -define compose:args=42 -composite \
+      \( -size "${SCREEN_H}x${SCREEN_W}" gradient:"gray70-gray20" -rotate 90 \) -compose multiply -composite \
+      -modulate 100,92,100 "$WALLPAPER" 2>/dev/null || return 1
+  fi
+
+  if [[ -f $WORDMARK ]]; then
+    magick "$WALLPAPER" "$WORDMARK" -gravity southeast -geometry +72+56 \
+      -compose over -composite "$WALLPAPER" 2>/dev/null
+    rm -f "$WORDMARK"
+  fi
+  [[ -s $WALLPAPER ]]
+}
+
+if build_wallpaper; then
+  log "  background: $(basename "$SRC_BG") + scrim + wordmark"
+else
+  # No usable image: a flat wash in the theme's own background colours.
+  magick -size "${SCREEN_W}x${SCREEN_H}" gradient:"$BACKGROUND-$SCRIM" "$WALLPAPER" 2>/dev/null ||
+    die "ImageMagick could not generate a background"
+  log "  background: generated gradient"
+fi
+
+# ------------------------------------------------------------------ icons ---
+
+STAMP="$UASSETS/xmb/custom/.omarchy-tint"
+if ((FORCE)) || [[ $(cat "$STAMP" 2>/dev/null) != "$ICON_TINT|$ACCENT|$ICON_STYLE" ]]; then
+  log "  icons: tinting $(find "$ICON_SRC" -name '*.png' | wc -l) glyphs → $ICON_TINT ($ICON_STYLE)"
+  rm -f "$STAMP"
+  # monochrome is the only complete set; the line-art set covers all of the UI
+  # and most platforms, so it goes on top and monochrome fills the gaps.
+  find "$ICON_SRC" -maxdepth 1 -name '*.png' -exec cp -f -t "$CUSTOM_ICONS" {} +
+  if [[ $ICON_STYLE == line && -d $ICON_SRC_LINE ]]; then
+    find "$ICON_SRC_LINE" -maxdepth 1 -name '*.png' -exec cp -f -t "$CUSTOM_ICONS" {} +
+  fi
+  find "$CUSTOM_ICONS" -name '*.png' -print0 |
+    xargs -0 -r magick mogrify -fill "$ICON_TINT" -colorize 100 2>/dev/null
+
+  # Main menu tab: Omarchy's logomark in the accent colour.
+  if [[ -f $LOGO_MARK ]]; then
+    magick "$LOGO_MARK" -trim +repage -resize 200x140 \
+      -fill "$ACCENT" -colorize 100 \
+      -background none -gravity center -extent 256x256 \
+      "$CUSTOM_ICONS/retroarch.png" 2>/dev/null
+  fi
+  echo "$ICON_TINT|$ACCENT|$ICON_STYLE" >"$STAMP"
+else
+  log "  icons: already tinted $ICON_TINT (use --force to rebuild)"
+fi
+
+# -------------------------------------------------------------- rgui theme ---
+
+# RGUI is the one menu driver that takes exact colours, so it gets the palette
+# verbatim rather than a nearest match.
+argb() { local hex="${2#\#}"; printf '0x%s%s\n' "$1" "${hex,,}"; }
+{
+  echo "rgui_entry_normal_color = \"$(argb ff "$FOREGROUND")\""
+  echo "rgui_entry_hover_color = \"$(argb ff "$ACCENT")\""
+  echo "rgui_title_color = \"$(argb ff "$ACCENT")\""
+  echo "rgui_bg_dark_color = \"$(argb f0 "$(color darker_background background)")\""
+  echo "rgui_bg_light_color = \"$(argb f0 "$BACKGROUND")\""
+  echo "rgui_border_dark_color = \"$(argb ff "$(color selection)")\""
+  echo "rgui_border_light_color = \"$(argb ff "$(color muted)")\""
+  echo "rgui_shadow_color = \"$(argb c0 '#000000')\""
+  echo "rgui_particle_color = \"$(argb 40 "$ACCENT")\""
+} >"$OMA_DIR/omarchy-rgui.cfg"
+
+# ----------------------------------------------------------------- config ---
+
+warn_if_running
+
+# One pristine copy of whatever RetroArch had before we ever touched it.
+[[ -f $BACKUP ]] || cp "$RA_CFG" "$BACKUP"
+
+FONT_TTF=$(fc-match -f '%{file}' "$(omarchy-font-current 2>/dev/null || echo monospace)" 2>/dev/null)
+[[ -f $FONT_TTF ]] || FONT_TTF=$(fc-match -f '%{file}' monospace 2>/dev/null)
+
+fg_hex="${FOREGROUND#\#}"
+FR=$((16#${fg_hex:0:2})) FG_=$((16#${fg_hex:2:2})) FB=$((16#${fg_hex:4:2}))
+
+set_cfg assets_directory "$UASSETS"
+set_cfg menu_driver "xmb"
+set_cfg xmb_theme 6                      # XMB_ICON_THEME_CUSTOM
+set_cfg xmb_menu_color_theme "$XMB_COLOR_IDX"
+set_cfg menu_shader_pipeline "$SHADER_PIPELINE"
+set_cfg xmb_alpha_factor 75
+set_cfg menu_wallpaper "$WALLPAPER"
+set_cfg menu_wallpaper_opacity "1.000000"
+set_cfg menu_dynamic_wallpaper_enable "false"
+[[ -f $FONT_TTF ]] && { set_cfg xmb_font "$FONT_TTF"; set_cfg video_font_path "$FONT_TTF"; }
+set_cfg menu_font_color_red "$FR"
+set_cfg menu_font_color_green "$FG_"
+set_cfg menu_font_color_blue "$FB"
+set_cfg xmb_shadows_enable "true"
+set_cfg rgui_menu_color_theme 0          # RGUI_THEME_CUSTOM
+set_cfg rgui_menu_theme_preset "$OMA_DIR/omarchy-rgui.cfg"
+
+log "  done — restart RetroArch to see it"
