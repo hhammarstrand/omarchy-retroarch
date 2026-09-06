@@ -31,7 +31,7 @@ dark icons, dark themes get a dark scrim and light icons.
 ## Install
 
 ```bash
-git clone https://github.com/USER/omarchy-retroarch.git
+git clone https://github.com/hhammarstrand/omarchy-retroarch.git
 cd omarchy-retroarch
 ./install.sh
 omarchy-retroarch-theme
