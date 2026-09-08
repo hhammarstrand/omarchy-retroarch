@@ -4,11 +4,26 @@
   retroarch-catalog ~/Roms          # skanna och skriv spellistor
   retroarch-catalog ~/Roms --dry    # visa bara vad som skulle skapas
 """
-import json, re, sys, zipfile, zlib
+import json, os, re, sys, zipfile, zlib
 from pathlib import Path
 
 CORES = Path("/usr/lib/libretro")
 PLAYLISTS = Path.home() / ".config/retroarch/playlists"
+# Enstaka spel kraschar den kärna systemet normalt använder. Raderna här
+# överlever en omkatalogisering:  <titelprefix><TAB><kärnnamn>
+OVERRIDES = Path.home() / ".config/omarchy-retroarch/core-overrides.tsv"
+
+
+def load_overrides():
+    out = []
+    if OVERRIDES.exists():
+        for line in OVERRIDES.read_text(encoding="utf-8").splitlines():
+            line = line.split("#")[0].strip()
+            if not line or "\t" not in line:
+                continue
+            prefix, core = line.split("\t", 1)
+            out.append((prefix.strip(), core.strip()))
+    return out
 
 # mappnamn (gemener, delsträng)  ->  (visningsnamn, kärna, filändelser)
 SYSTEMS = [
@@ -101,6 +116,7 @@ def main():
         sys.exit(f"finns inte: {root}")
     PLAYLISTS.mkdir(parents=True, exist_ok=True)
 
+    overrides = load_overrides()
     total_games = 0
     report = []
     for entry in sorted(root.iterdir()):
@@ -125,10 +141,18 @@ def main():
                 continue
             if NOT_A_GAME.search(path.stem) and not REAL_GAME.search(path.stem):
                 continue   # ljudripp, PD-släpp eller demo - inte ett spel
+            label = clean_label(path.name)
+            core_for_item = core
+            for prefix, alt in overrides:
+                if label.startswith(prefix):
+                    cand = CORES / f"{alt}_libretro.so"
+                    if cand.exists():
+                        core_for_item = cand
+                    break
             items.append({
                 "path": str(path),
-                "label": clean_label(path.name),
-                "core_path": str(core) if core.exists() else "DETECT",
+                "label": label,
+                "core_path": str(core_for_item) if core_for_item.exists() else "DETECT",
                 "core_name": "DETECT",
                 "crc32": crc_of(path),
                 "db_name": f"{sysname}.lpl",

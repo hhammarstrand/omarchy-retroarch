@@ -92,6 +92,14 @@ writes `.lpl` playlists. It skips save files, emulator binaries, PC programs and
 audio rips, and keeps one entry per game when the same ROM exists as both a raw
 file and an archive.
 
+A game that crashes the core its system normally uses can be pinned to another
+one in `~/.config/omarchy-retroarch/core-overrides.tsv` — `title prefix`, a tab,
+then a core name. Those survive re-cataloguing:
+
+```
+Aero Blasters	mednafen_pce_fast
+```
+
 **`retroarch-titles`** is the interesting one. RetroArch ships ~145 databases in a
 binary format (`RARCHDB` + MessagePack) with no command-line reader, so this
 contains one. It matches by CRC32 first — the same checksum RetroArch computes —
