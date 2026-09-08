@@ -14,7 +14,8 @@ fi
 
 rm -f "$HOOK_DIR/theme-set.d/retroarch" "$HOOK_DIR/font-set.d/retroarch"
 for tool in omarchy-retroarch-theme retroarch-catalog retroarch-titles \
-            retroarch-thumbnails retroarch-placeholders retroarch-optimize; do
+            retroarch-thumbnails retroarch-placeholders retroarch-optimize \
+            retroarch-export-atv; do
   rm -f "$BIN_DIR/$tool"
 done
 rm -rf "${SHARE_DIR:-$HOME/.local/share/omarchy-retroarch}"

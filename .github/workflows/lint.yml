@@ -19,3 +19,20 @@ jobs:
             uninstall.sh \
             hooks/theme-set.d/retroarch \
             hooks/font-set.d/retroarch
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Byte-compile the python tools
+        run: |
+          python -m py_compile \
+            bin/retroarch-catalog \
+            bin/retroarch-titles \
+            bin/retroarch-thumbnails \
+            bin/retroarch-placeholders \
+            bin/retroarch-optimize \
+            bin/retroarch-export-atv

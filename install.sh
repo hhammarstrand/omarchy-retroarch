@@ -27,7 +27,8 @@ SHARE_DIR="${SHARE_DIR:-$HOME/.local/share/omarchy-retroarch}"
 mkdir -p "$BIN_DIR" "$HOOK_DIR/theme-set.d" "$HOOK_DIR/font-set.d" "$SHARE_DIR"
 
 for tool in omarchy-retroarch-theme retroarch-catalog retroarch-titles \
-            retroarch-thumbnails retroarch-placeholders retroarch-optimize; do
+            retroarch-thumbnails retroarch-placeholders retroarch-optimize \
+            retroarch-export-atv; do
   install -m 755 "$SRC_DIR/bin/$tool" "$BIN_DIR/$tool"
 done
 install -m 755 "$SRC_DIR/hooks/theme-set.d/retroarch" "$HOOK_DIR/theme-set.d/retroarch"
@@ -41,6 +42,7 @@ echo "  retroarch-titles          replace filenames with real database titles"
 echo "  retroarch-thumbnails      fetch cover art"
 echo "  retroarch-placeholders    draw covers for games that have none"
 echo "  retroarch-optimize        performance settings for weak CPUs"
+echo "  retroarch-export-atv      copy the library to RetroArch on an Apple TV"
 echo""
 echo "  $HOOK_DIR/theme-set.d/retroarch"
 echo "  $HOOK_DIR/font-set.d/retroarch"

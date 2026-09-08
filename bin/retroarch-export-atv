@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Kopiera biblioteket till RetroArch på Apple TV över dess webbserver.
+
+RetroArch på tvOS startar en GCDWebUploader när appen är i förgrunden.
+Den exponerar list/upload/create, vilket räcker för att flytta över hela
+biblioteket - inklusive omslag, som annars är det tråkigaste att göra för hand.
+
+  retroarch-export-atv 10.10.0.114                # allt
+  retroarch-export-atv 10.10.0.114 --only "Nintendo 64"
+  retroarch-export-atv 10.10.0.114 --no-roms      # bara listor och omslag
+"""
+import argparse, json, os, pathlib, sys, urllib.parse, urllib.request
+
+PL = pathlib.Path.home() / ".config/retroarch/playlists"
+TH = pathlib.Path.home() / ".config/retroarch/thumbnails"
+BIOS = pathlib.Path.home() / "Games/bios"
+# tvOS expanderar ~ själv, och app-containerns UUID ändras vid varje
+# uppdatering - därför får sökvägarna aldrig vara absoluta.
+REMOTE_ROOT = "~/Library/Caches/RetroArch"
+
+
+def api(host, path, params=None):
+    url = f"http://{host}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=30) as r:
+        return json.loads(r.read().decode())
+
+
+def listing(host, path):
+    try:
+        return {e["name"] for e in api(host, "/list", {"path": path})}
+    except Exception:
+        return set()
+
+
+def mkdir(host, parent, name):
+    """create vill ha hela sökvägen, och skapar en numrerad dubblett i stället
+    för att klaga om katalogen redan finns - så vi kollar först."""
+    full = parent.rstrip("/") + "/" + name
+    if name in listing(host, parent):
+        return full
+    body = urllib.parse.urlencode({"path": full}).encode()
+    req = urllib.request.Request(f"http://{host}/create", data=body, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception:
+        pass
+    return full
+
+
+def upload(host, local: pathlib.Path, remote_dir: str) -> bool:
+    """En fil i taget via curl, som strömmar från disk.
+
+    Att läsa in filen i minnet och skicka tre parallellt kraschade RetroArch
+    på tvOS - appen buffrar uppladdningar och har begränsat minne. GCDWebUploader
+    vill dessutom ha `path` som formulärfält, inte som query-parameter.
+    """
+    import subprocess
+    r = subprocess.run(
+        ["curl", "-s", "-f", "--max-time", "900", "-o", "/dev/null",
+         # Filnamnet citeras: curl behandlar annars komma i ett -F-värde som
+         # separator mellan flera filer, vilket sabbar t.ex. "(Japan, USA)".
+         "-F", f"path={remote_dir}", "-F", 'files[]=@"' + str(local) + '"',
+         f"http://{host}/upload"],
+        capture_output=True)
+    return r.returncode == 0
+
+
+def disc_tracks(cue: pathlib.Path):
+    """Spårfilerna en .cue pekar ut.
+
+    En cue-fil är bara ett textindex - utan sina .bin-spår startar spelet inte.
+    Referenserna är ofta skrivna med fel skiftläge, och ibland med en hel
+    Windows-sökväg, så vi tar basnamnet och matchar skiftlägesokänsligt.
+    """
+    if cue.suffix.lower() not in (".cue", ".gdi", ".ccd", ".m3u"):
+        return []
+    try:
+        text = cue.read_text(errors="ignore")
+    except OSError:
+        return []
+    siblings = {c.name.lower(): c for c in cue.parent.iterdir() if c.is_file()}
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if cue.suffix.lower() == ".m3u":
+            ref = line
+        elif line.upper().startswith("FILE") and '"' in line:
+            ref = line.split('"')[1]
+        else:
+            continue
+        if not ref or ref.startswith("#"):
+            continue
+        hit = siblings.get(os.path.basename(ref.replace("\\", "/")).lower())
+        if hit and hit != cue:
+            out.append(hit)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("host")
+    ap.add_argument("--only", default=None, help="bara system vars namn innehåller detta")
+    ap.add_argument("--no-roms", action="store_true")
+    a = ap.parse_args()
+
+    try:
+        api(a.host, "/list", {"path": "/"})
+    except Exception:
+        sys.exit(f"når inte {a.host} - starta RetroArch på Apple TV:n och lämna den i förgrunden")
+
+    mkdir(a.host, "/", "roms")
+    sent = skipped = failed = 0
+
+    for lpl in sorted(PL.glob("*.lpl")):
+        if lpl.stem.startswith("content_") or (a.only and a.only.lower() not in lpl.stem.lower()):
+            continue
+        data = json.loads(lpl.read_text(encoding="utf-8"))
+        items = data["items"]
+        print(f"\n  {lpl.stem}  ({len(items)} spel)", flush=True)
+
+        # ROM
+        if not a.no_roms:
+            mkdir(a.host, "/roms/", lpl.stem)
+            have = listing(a.host, f"/roms/{lpl.stem}/")
+            wanted = []
+            for i in items:
+                pth = pathlib.Path(i["path"].split("#")[0])
+                if not pth.exists():
+                    continue
+                for f in [pth, *disc_tracks(pth)]:
+                    if f not in wanted:
+                        wanted.append(f)
+            todo = [f for f in wanted if f.name not in have]
+            skipped += len(wanted) - len(todo)
+            for n, pth in enumerate(todo, 1):
+                ok = upload(a.host, pth, f"/roms/{lpl.stem}/")
+                sent += ok; failed += not ok
+                if n % 25 == 0:
+                    print(f"      {n}/{len(todo)}", flush=True)
+            print(f"    rom: {len(todo)} skickade", flush=True)
+
+        # omslag
+        src = TH / lpl.stem / "Named_Boxarts"
+        if src.is_dir():
+            mkdir(a.host, "/thumbnails/", lpl.stem)
+            mkdir(a.host, f"/thumbnails/{lpl.stem}/", "Named_Boxarts")
+            have = listing(a.host, f"/thumbnails/{lpl.stem}/Named_Boxarts/")
+            todo = [f for f in src.glob("*.png") if f.name not in have]
+            for n, f in enumerate(todo, 1):
+                ok = upload(a.host, f, f"/thumbnails/{lpl.stem}/Named_Boxarts/")
+                sent += ok; failed += not ok
+                if n % 100 == 0:
+                    print(f"      {n}/{len(todo)}", flush=True)
+            print(f"    omslag: {len(todo)} skickade", flush=True)
+
+        # spellista med tvOS-sökvägar; kärnorna ligger i appbunten, så DETECT
+        out = dict(data)
+        out["default_core_path"] = ""
+        out["default_core_name"] = ""
+        out["items"] = [{**i,
+                         "path": f"{REMOTE_ROOT}/roms/{lpl.stem}/{pathlib.Path(i['path']).name}",
+                         "core_path": "DETECT", "core_name": "DETECT"}
+                        for i in items]
+        tmp = pathlib.Path("/tmp") / lpl.name
+        tmp.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Servern skapar "namn (1).lpl" i stället för att skriva över, så en
+        # befintlig spellista måste bort först - annars växer dubbletterna
+        # för varje körning.
+        if lpl.name in listing(a.host, "/playlists/"):
+            body = urllib.parse.urlencode({"path": f"/playlists/{lpl.name}"}).encode()
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    f"http://{a.host}/delete", data=body, method="POST"), timeout=30).read()
+            except Exception:
+                pass
+        ok = upload(a.host, tmp, "/playlists/")
+        tmp.unlink()
+        print(f"    spellista: {'skickad' if ok else 'MISSLYCKADES'}", flush=True)
+        sent += ok; failed += not ok
+
+    if BIOS.is_dir():
+        have = listing(a.host, "/system/")
+        for f in BIOS.rglob("*"):
+            if f.is_file() and f.name not in have:
+                sent += upload(a.host, f, "/system/")
+    print(f"\n  {sent} filer skickade, {skipped} fanns redan, {failed} misslyckades")
+
+
+if __name__ == "__main__":
+    main()

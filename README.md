@@ -39,7 +39,7 @@ omarchy-retroarch-theme
 
 Then restart RetroArch.
 
-That installs six commands into `~/.local/bin` and two hooks into
+That installs seven commands into `~/.local/bin` and two hooks into
 `~/.config/omarchy/hooks/`. Nothing is installed system-wide, and nothing needs root.
 
 ### Requirements
@@ -77,7 +77,7 @@ Options via environment:
 ## Building a library
 
 The theme is one half. The other is turning a directory of ROMs into playlists
-with real titles and cover art. Five commands do that, and each is safe to re-run:
+with real titles and cover art. Six commands do that, and each is safe to re-run:
 
 ```bash
 retroarch-catalog ~/Roms      # scan a directory into RetroArch playlists
@@ -85,6 +85,7 @@ retroarch-titles              # replace filenames with database titles
 retroarch-thumbnails          # fetch cover art from libretro's server
 retroarch-placeholders        # draw themed covers for whatever has none
 retroarch-optimize            # performance settings for a weak CPU
+retroarch-export-atv <ip>     # copy the finished library to an Apple TV
 ```
 
 **`retroarch-catalog`** matches folder names to systems, picks a core for each, and
@@ -117,6 +118,25 @@ FBNeo and MAME repositories for arcade playlists.
 anything still without one — obscure Japanese releases and homebrew that was never
 photographed. It is the difference between a complete-looking library and a grid
 with holes in it.
+
+**`retroarch-export-atv`** copies the finished library — ROMs, cover art and
+playlists — to RetroArch on a tvOS device. RetroArch there runs a small web
+uploader whenever the app is in the foreground, which is the only way in; the
+alternative is moving several thousand files by hand. Playlists are rewritten
+with tvOS paths and `DETECT` cores, since the cores live inside the app bundle
+and are not where they are on a desktop.
+
+```bash
+retroarch-export-atv 10.0.0.42                    # everything
+retroarch-export-atv 10.0.0.42 --only "Nintendo 64"
+retroarch-export-atv 10.0.0.42 --no-roms          # only playlists and covers
+```
+
+Leave RetroArch open and in the foreground on the device for the whole run.
+Files go up one at a time, streamed from disk: uploading in parallel, or reading
+a file into memory first, crashes the app. A re-run skips what is already there,
+and disc images bring their track files with them — a `.cue` on its own is a
+text index that will not boot.
 
 **`retroarch-optimize`** turns off the shader chain, which on a CPU-limited machine
 costs more than it looks: shader passes are draw calls, and draw calls are CPU. On
