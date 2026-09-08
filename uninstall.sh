@@ -14,6 +14,7 @@ fi
 
 rm -f "$HOOK_DIR/theme-set.d/retroarch" "$HOOK_DIR/font-set.d/retroarch"
 rm -f "$BIN_DIR/omarchy-retroarch-theme"
+rm -rf "${SHARE_DIR:-$HOME/.local/share/omarchy-retroarch}"
 
 echo "Removed the command and both hooks."
 echo "RetroArch's pre-install config was restored if a backup existed"

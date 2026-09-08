@@ -22,16 +22,20 @@ if ((${#missing[@]})); then
   exit 1
 fi
 
-mkdir -p "$BIN_DIR" "$HOOK_DIR/theme-set.d" "$HOOK_DIR/font-set.d"
+SHARE_DIR="${SHARE_DIR:-$HOME/.local/share/omarchy-retroarch}"
+
+mkdir -p "$BIN_DIR" "$HOOK_DIR/theme-set.d" "$HOOK_DIR/font-set.d" "$SHARE_DIR"
 
 install -m 755 "$SRC_DIR/bin/omarchy-retroarch-theme" "$BIN_DIR/omarchy-retroarch-theme"
 install -m 755 "$SRC_DIR/hooks/theme-set.d/retroarch" "$HOOK_DIR/theme-set.d/retroarch"
 install -m 755 "$SRC_DIR/hooks/font-set.d/retroarch" "$HOOK_DIR/font-set.d/retroarch"
+install -m 644 "$SRC_DIR/share/retromarchy.svg" "$SHARE_DIR/retromarchy.svg"
 
 echo "Installed:"
 echo "  $BIN_DIR/omarchy-retroarch-theme"
 echo "  $HOOK_DIR/theme-set.d/retroarch"
 echo "  $HOOK_DIR/font-set.d/retroarch"
+echo "  $SHARE_DIR/retromarchy.svg"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
