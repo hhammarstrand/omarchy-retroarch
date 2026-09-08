@@ -36,6 +36,10 @@ STATE="$HOME/.local/state/omarchy/current"
 OMARCHY_SHARE="${OMARCHY_PATH:-/usr/share/omarchy}"
 LOGO_SVG="$OMARCHY_SHARE/logo.svg"
 LOGO_MARK="$OMARCHY_SHARE/default/plymouth/logos/oma.png"
+# "RETROMARCHY" i Omarchys blockstil. Omarchys egen font innehåller bara
+# bokstäverna i "omarchy" (a c h m o r y), så E och T finns inte i något
+# varumärkesmaterial - den här SVG:n ritar dem i samma pixelrutnät.
+WORDMARK_SVG="${OMARCHY_RETROARCH_WORDMARK:-$HOME/.local/share/omarchy-retroarch/retromarchy.svg}"
 
 # solid = filled glyphs/badges (monochrome set), line = hairline outlines (automatic set)
 ICON_STYLE="${OMARCHY_RETROARCH_ICONS:-line}"
@@ -378,14 +382,28 @@ SRC_BG=$(pick_background)
 WALLPAPER="$OMA_DIR/menu-background.png"
 WORDMARK="$OMA_DIR/.wordmark.png"
 
+# Ordmärket renderas ur SVG:n; saknas den faller vi tillbaka på Omarchys
+# egen logotyp så temat fungerar även utan den här installationens assets.
+build_wordmark() {
+  local out="$1" src="$WORDMARK_SVG" tmp
+  [[ -f $src ]] || src="$LOGO_SVG"
+  [[ -f $src ]] || return 1
+  tmp=$(mktemp) || return 1
+  sed 's/fill="#000"/fill="#ffffff"/g' "$src" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  magick -background none "$tmp" -resize $((SCREEN_W / 5))x \
+    -fill "$ICON_TINT" -colorize 100 \
+    -alpha set -channel A -evaluate multiply 0.20 +channel \
+    png32:"$out" 2>/dev/null
+  rm -f "$tmp"
+  [[ -s $out ]]
+}
+
+
 build_wallpaper() {
   [[ -f $SRC_BG ]] || return 1
 
   if [[ -f $LOGO_SVG ]]; then
-    magick -background none "$LOGO_SVG" -resize $((SCREEN_W / 7))x \
-      -fill "$ICON_TINT" -colorize 100 \
-      -alpha set -channel A -evaluate multiply 0.20 +channel \
-      "$WORDMARK" 2>/dev/null || rm -f "$WORDMARK"
+    build_wordmark "$WORDMARK" || rm -f "$WORDMARK"
   fi
 
   # Wash the photo toward the theme's own background, then fall off along the
