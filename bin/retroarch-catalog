@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Bygg RetroArch-spellistor från en ROM-katalog.
+
+  retroarch-catalog ~/Roms          # skanna och skriv spellistor
+  retroarch-catalog ~/Roms --dry    # visa bara vad som skulle skapas
+"""
+import json, re, sys, zipfile, zlib
+from pathlib import Path
+
+CORES = Path("/usr/lib/libretro")
+PLAYLISTS = Path.home() / ".config/retroarch/playlists"
+
+# mappnamn (gemener, delsträng)  ->  (visningsnamn, kärna, filändelser)
+SYSTEMS = [
+    ("nintendo nes",      "Nintendo - Nintendo Entertainment System",       "nestopia",         {".nes", ".zip", ".7z", ".unf", ".fds"}),
+    ("snes",              "Nintendo - Super Nintendo Entertainment System", "snes9x",           {".sfc", ".smc", ".zip", ".7z"}),
+    ("mega drive",        "Sega - Mega Drive - Genesis",                    "genesis_plus_gx",  {".md", ".gen", ".bin", ".smd", ".zip", ".7z"}),
+    ("master system",     "Sega - Master System - Mark III",                "genesis_plus_gx",  {".sms", ".zip", ".7z"}),
+    ("nintendo 64",       "Nintendo - Nintendo 64",                         "mupen64plus_next", {".n64", ".z64", ".v64", ".zip", ".7z"}),
+    ("gameboy advance",   "Nintendo - Game Boy Advance",                     "mgba",             {".gba", ".zip", ".7z"}),
+    ("turbografx",        "NEC - PC Engine - TurboGrafx 16",                "mednafen_pce",     {".pce", ".sgx", ".zip", ".7z"}),
+    ("neo geo",           "SNK - Neo Geo",                                  "fbneo",            {".zip", ".7z"}),
+    # Paketet är byggt för MAME 0.30 (1997). Moderna MAME-kärnor matchar inte
+    # de gamla romseten alls; mame2000 (0.37b5) är närmast och klarar en del.
+    ("mame",              "MAME",                                           "mame2000",         {".zip", ".7z"}),
+    ("atari 2600",        "Atari - 2600",                                    "stella",           {".a26", ".bin", ".zip", ".7z"}),
+    ("zx spectrum",       "Sinclair - ZX Spectrum",                          "fuse",             {".tap", ".tzx", ".z80", ".sna", ".zip"}),
+    ("nds",               "Nintendo - Nintendo DS",                          "melonds",          {".nds", ".zip"}),
+    ("ps",                "Sony - PlayStation",                              "mednafen_psx_hw",  {".cue", ".chd", ".pbp", ".m3u", ".ccd"}),
+]
+
+# filer som aldrig är spel
+JUNK_NAMES = {"neogeo.zip", "neocdz.zip", "decocass.zip", "delete.zip"}
+# Zippade sparfiler och emulatorbinärer ligger blandade med spelen i paketet
+# Ljudrippar, public domain-släpp och demos är inte spel. Undantaget är
+# riktiga spel som bär hack-/översättningsmarkör eller heter "Demo ..." på riktigt.
+NOT_A_GAME = re.compile(r"\bsounds?\s*$|\(PD\)|\bdemo\b", re.I)
+REAL_GAME = re.compile(r"\[T-En|\[T\+|\[h[\s\]]|\[p\]|\[a[\s\]]|\[b\d|^demo\b", re.I)
+JUNK_STEM_RE = re.compile(r"\.(srm|sav|state|st\d|cfg|hi|nv)$", re.I)
+JUNK_RE = re.compile(r"(^|/)(bios|samples|artwork|snap|cheats?)(/|$)", re.I)
+
+
+def clean_label(name: str) -> str:
+    """Filnamn -> läsbar titel. Behåller region, tar bort dump-taggar."""
+    label = re.sub(r"\.[A-Za-z0-9]{1,4}$", "", name)
+    label = re.sub(r"\s*\[[^\]]*\]", "", label)      # [!], [p1], [b2] ...
+    label = re.sub(r"\s*\{[^}]*\}", "", label)
+    label = re.sub(r"\s+", " ", label).strip(" -_")
+    return label or name
+
+
+def crc_of(path: Path) -> str:
+    """CRC32 som RetroArch skulle räkna ut. Gratis för zip (finns i katalogen)."""
+    try:
+        if path.suffix.lower() == ".zip":
+            with zipfile.ZipFile(path) as z:
+                for info in z.infolist():
+                    if not info.is_dir():
+                        return f"{info.CRC & 0xFFFFFFFF:08X}|crc"
+        elif path.stat().st_size <= 32 * 1024 * 1024:
+            crc = 0
+            with path.open("rb") as fh:
+                while chunk := fh.read(1 << 20):
+                    crc = zlib.crc32(chunk, crc)
+            return f"{crc & 0xFFFFFFFF:08X}|crc"
+    except Exception:
+        pass
+    return "00000000|crc"
+
+
+def is_pc_archive(path: Path) -> bool:
+    """Zip som innehåller en körbar PC-fil är ett PC-program, inte en ROM.
+    Fångar t.ex. PC-remakes och medföljande emulatorer."""
+    if path.suffix.lower() != ".zip":
+        return False
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = [i.filename.lower() for i in z.infolist() if not i.is_dir()]
+    except Exception:
+        return False
+    if not names:
+        return False
+    exe = {".exe", ".com", ".bat", ".pif", ".dll", ".msi"}
+    return all(Path(n).suffix in exe or Path(n).suffix in {".txt", ".dat", ".ini", ".cfg", ".bmp", ".ani", ".cur"}
+               for n in names) and any(Path(n).suffix in exe for n in names)
+
+
+def match_system(folder: str):
+    low = folder.lower()
+    best = None
+    for key, name, core, exts in SYSTEMS:
+        if key in low and (best is None or len(key) > len(best[0])):
+            best = (key, name, core, exts)
+    return best
+
+
+def main():
+    root = Path(sys.argv[1] if len(sys.argv) > 1 else Path.home() / "Roms").expanduser()
+    dry = "--dry" in sys.argv
+    if not root.is_dir():
+        sys.exit(f"finns inte: {root}")
+    PLAYLISTS.mkdir(parents=True, exist_ok=True)
+
+    total_games = 0
+    report = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        sysinfo = match_system(entry.name)
+        if not sysinfo:
+            report.append((entry.name, "-", 0, "ingen systemmatchning"))
+            continue
+        _, sysname, corename, exts = sysinfo
+        core = CORES / f"{corename}_libretro.so"
+
+        items = []
+        for path in sorted(entry.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in exts:
+                continue
+            if path.name.lower() in JUNK_NAMES or JUNK_RE.search(str(path.relative_to(entry))):
+                continue
+            if JUNK_STEM_RE.search(path.stem):   # t.ex. "Super Mario Kart (U).srm.zip"
+                continue
+            if is_pc_archive(path):   # PC-program, inte konsol-ROM
+                continue
+            if NOT_A_GAME.search(path.stem) and not REAL_GAME.search(path.stem):
+                continue   # ljudripp, PD-släpp eller demo - inte ett spel
+            items.append({
+                "path": str(path),
+                "label": clean_label(path.name),
+                "core_path": str(core) if core.exists() else "DETECT",
+                "core_name": "DETECT",
+                "crc32": crc_of(path),
+                "db_name": f"{sysname}.lpl",
+            })
+
+        # Samma spel ligger ofta som både .gba och .gba.zip - behåll en post,
+        # med okomprimerat format före arkiv.
+        ARCHIVES = {".zip", ".7z"}
+        best = {}
+        for it in items:
+            key = it["label"].lower()
+            cur = best.get(key)
+            if cur is None or (Path(cur["path"]).suffix.lower() in ARCHIVES
+                               and Path(it["path"]).suffix.lower() not in ARCHIVES):
+                best[key] = it
+        items = sorted(best.values(), key=lambda i: i["label"].lower())
+
+        status = "ok" if core.exists() else f"KÄRNA SAKNAS ({corename})"
+        report.append((entry.name, sysname, len(items), status))
+        total_games += len(items)
+
+        if items and not dry:
+            (PLAYLISTS / f"{sysname}.lpl").write_text(json.dumps({
+                "version": "1.5",
+                "default_core_path": str(core) if core.exists() else "",
+                "default_core_name": "",
+                "label_display_mode": 0,
+                "right_thumbnail_mode": 4,
+                "left_thumbnail_mode": 0,
+                "sort_mode": 0,
+                "items": items,
+            }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    w = max(len(r[0]) for r in report) if report else 10
+    for folder, sysname, n, status in report:
+        print(f"  {folder:<{w}}  {n:>5} spel  {status}")
+    print(f"\n  {total_games} spel totalt i {sum(1 for r in report if r[2])} spellistor")
+    if dry:
+        print("  (torrkörning - inget skrevs)")
+
+
+if __name__ == "__main__":
+    main()

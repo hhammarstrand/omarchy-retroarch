@@ -39,7 +39,7 @@ omarchy-retroarch-theme
 
 Then restart RetroArch.
 
-That installs one command into `~/.local/bin` and two hooks into
+That installs six commands into `~/.local/bin` and two hooks into
 `~/.config/omarchy/hooks/`. Nothing is installed system-wide, and nothing needs root.
 
 ### Requirements
@@ -74,6 +74,49 @@ Options via environment:
 
 ---
 
+## Building a library
+
+The theme is one half. The other is turning a directory of ROMs into playlists
+with real titles and cover art. Five commands do that, and each is safe to re-run:
+
+```bash
+retroarch-catalog ~/Roms      # scan a directory into RetroArch playlists
+retroarch-titles              # replace filenames with database titles
+retroarch-thumbnails          # fetch cover art from libretro's server
+retroarch-placeholders        # draw themed covers for whatever has none
+retroarch-optimize            # performance settings for a weak CPU
+```
+
+**`retroarch-catalog`** matches folder names to systems, picks a core for each, and
+writes `.lpl` playlists. It skips save files, emulator binaries, PC programs and
+audio rips, and keeps one entry per game when the same ROM exists as both a raw
+file and an archive.
+
+**`retroarch-titles`** is the interesting one. RetroArch ships ~145 databases in a
+binary format (`RARCHDB` + MessagePack) with no command-line reader, so this
+contains one. It matches by CRC32 first — the same checksum RetroArch computes —
+then falls back to `rom_name` and to a normalised title. That fallback handles the
+things real ROM collections are full of: catalogue numbers (`2581 - Sigma
+Harmonics`), inverted articles (the database writes `American Tail, An`), roman
+numerals (`alphamission2` against `Alpha Mission II`), and region variants of the
+same title.
+
+**`retroarch-thumbnails`** matches those titles against libretro's thumbnail
+server, falling back from box art to title screens to snapshots, and searching the
+FBNeo and MAME repositories for arcade playlists.
+
+**`retroarch-placeholders`** draws a cover in the current Omarchy palette for
+anything still without one — obscure Japanese releases and homebrew that was never
+photographed. It is the difference between a complete-looking library and a grid
+with holes in it.
+
+**`retroarch-optimize`** turns off the shader chain, which on a CPU-limited machine
+costs more than it looks: shader passes are draw calls, and draw calls are CPU. On
+a Pentium G4400 with a GTX 1080 Ti this took Donkey Kong 64 from 100 to 164 fps.
+`revert` puts it back; `crt` swaps in a 2-pass CRT filter instead of a 13-pass one.
+
+---
+
 ## How it works
 
 Everything is derived from the theme's `colors.toml`, resolved through Omarchy's own
@@ -88,7 +131,7 @@ which is the only complete one, so the handful of platform logos it lacks still 
 
 **Background.** Your current desktop wallpaper, washed toward the theme's darkest
 background colour, with a vertical falloff so the menu column keeps its contrast, and
-the Omarchy wordmark set into the corner at low opacity. Themes without a usable image
+a RETROMARCHY wordmark set into the corner at low opacity. Themes without a usable image
 get a flat gradient in their own colours instead.
 
 **Colours.** Menu font colours are written as exact RGB from the palette. XMB's

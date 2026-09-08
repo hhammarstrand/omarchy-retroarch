@@ -8,7 +8,7 @@
 # omarchy-retroarch-theme — dress RetroArch in the current Omarchy theme.
 #
 # Generates, from the active Omarchy palette:
-#   - a menu background built from your desktop wallpaper (scrim + Omarchy wordmark)
+#   - a menu background built from your desktop wallpaper (scrim + RETROMARCHY wordmark)
 #   - a full XMB icon set tinted in the theme's foreground colour
 #   - the Omarchy logomark as the main menu icon, in the theme's accent colour
 #   - exact menu font colours, and an exact-hex RGUI palette
@@ -30,7 +30,7 @@
 
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 STATE="$HOME/.local/state/omarchy/current"
 OMARCHY_SHARE="${OMARCHY_PATH:-/usr/share/omarchy}"

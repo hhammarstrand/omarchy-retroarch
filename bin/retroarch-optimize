@@ -1,0 +1,47 @@
+#!/bin/bash
+# Prestandainställningar för en CPU-svag maskin med kraftigt grafikkort.
+#
+# Utgångsläget här är en Pentium G4400 (2 kärnor) och ett GTX 1080 Ti. All
+# emulering är CPU-bunden, så allt som kostar CPU-tid ska bort och allt som
+# kan lastas av till GPU:n ska dit.
+set -uo pipefail
+CFG="$HOME/.config/retroarch/retroarch.cfg"
+[[ -f $CFG ]] || { echo "hittar ingen retroarch.cfg" >&2; exit 1; }
+pgrep -x retroarch >/dev/null && {
+  echo "RetroArch kör - stäng den först, annars skrivs ändringarna över." >&2; exit 1; }
+
+set_cfg() {
+  local k=$1 v=$2
+  if grep -q "^$k = " "$CFG"; then sed -i "s|^$k = .*|$k = \"$v\"|" "$CFG"
+  else printf '%s = "%s"\n' "$k" "$v" >>"$CFG"; fi
+}
+
+case "${1:-apply}" in
+  apply)
+    # 13 shader-pass kostar draw calls på CPU:n, inte fyllnad på GPU:n.
+    # Mätt: tunga N64-spel faller under full hastighet med shadern på.
+    set_cfg video_shader_enable false
+    # OBS: video_max_swapchain_images=2 testades och SÄNKTE prestandan 29 %
+    # på den här maskinen. Lämnas på 3.
+    # Låt kärnorna rendera på GPU:n där de kan.
+    set_cfg video_shared_context true
+    # run-ahead kör kärnan två gånger per bildruta - orimligt på två kärnor.
+    set_cfg run_ahead_enabled false
+    # Trådad video flyttar presentationen från emuleringstråden.
+    set_cfg video_threaded true
+    echo "Optimerat. Kör 'retroarch-optimize revert' för att ångra."
+    ;;
+  revert)
+    set_cfg video_shader_enable true
+    set_cfg video_shared_context false
+    echo "Återställt till utgångsläget."
+    ;;
+  crt)
+    # Vill du ha CRT-looken tillbaka men billigare
+    set_cfg video_shader_enable true
+    echo '#reference "/usr/share/libretro/shaders/shaders_slang/crt/crt-pi.slangp"' \
+      > "$HOME/.config/retroarch/config/global.slangp"
+    echo "CRT-look via crt-pi (2 pass i stället för 13)."
+    ;;
+  *) echo "användning: retroarch-optimize [apply|revert|crt]"; exit 1 ;;
+esac

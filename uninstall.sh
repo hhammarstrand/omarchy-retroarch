@@ -13,7 +13,10 @@ if command -v omarchy-retroarch-theme >/dev/null; then
 fi
 
 rm -f "$HOOK_DIR/theme-set.d/retroarch" "$HOOK_DIR/font-set.d/retroarch"
-rm -f "$BIN_DIR/omarchy-retroarch-theme"
+for tool in omarchy-retroarch-theme retroarch-catalog retroarch-titles \
+            retroarch-thumbnails retroarch-placeholders retroarch-optimize; do
+  rm -f "$BIN_DIR/$tool"
+done
 rm -rf "${SHARE_DIR:-$HOME/.local/share/omarchy-retroarch}"
 
 echo "Removed the command and both hooks."

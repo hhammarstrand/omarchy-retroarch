@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Rita omslag i Omarchy-stil för spel som saknar bild på bildservern.
+
+Vissa titlar - obskyra japanska utgåvor, hembryggt, piratvarianter - har
+aldrig fotograferats. De får ett genererat kort i temats färger i stället
+för en tom ruta.
+"""
+import json, pathlib, re, subprocess, textwrap
+
+PL = pathlib.Path.home()/".config/retroarch/playlists"
+TH = pathlib.Path.home()/".config/retroarch/thumbnails"
+W, H = 512, 720
+
+
+def theme_color(key, fallback):
+    try:
+        v = subprocess.run(["omarchy-theme-color", key], capture_output=True,
+                           text=True, timeout=10).stdout.strip()
+        return v or fallback
+    except Exception:
+        return fallback
+
+
+def font_path():
+    try:
+        fam = subprocess.run(["omarchy-font-current"], capture_output=True,
+                             text=True, timeout=10).stdout.strip() or "monospace"
+    except Exception:
+        fam = "monospace"
+    return subprocess.run(["fc-match", "-f", "%{file}", fam],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def main():
+    bg = theme_color("background", "#111c18")
+    dark = theme_color("darker_background", "#090f0d")
+    fg = theme_color("foreground", "#c1c497")
+    accent = theme_color("accent", "#509475")
+    font = font_path()
+    made = 0
+    for lpl in sorted(PL.glob("*.lpl")):
+        dest = TH/lpl.stem/"Named_Boxarts"
+        dest.mkdir(parents=True, exist_ok=True)
+        system = re.sub(r"^[A-Z]+ - ", "", lpl.stem)
+        for it in json.loads(lpl.read_text(encoding="utf-8"))["items"]:
+            out = dest/(re.sub(r'[/\\]', "_", it["label"]) + ".png")
+            if out.exists():
+                continue
+            title = re.sub(r"\s*[\(\[].*", "", it["label"]).strip() or it["label"]
+            wrapped = "\n".join(textwrap.wrap(title, 16)[:5])
+            subprocess.run([
+                "magick", "-size", f"{W}x{H}", f"gradient:{bg}-{dark}",
+                "-bordercolor", accent, "-border", "6",
+                "-resize", f"{W}x{H}!",
+                "-font", font, "-fill", fg, "-pointsize", "46", "-gravity", "center",
+                "-annotate", "+0-40", wrapped,
+                "-fill", accent, "-pointsize", "24", "-gravity", "south",
+                "-annotate", "+0+48", system,
+                str(out)], capture_output=True, timeout=30)
+            if out.exists():
+                made += 1
+    print(f"  {made} omslag genererade")
+
+
+if __name__ == "__main__":
+    main()

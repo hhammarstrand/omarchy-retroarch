@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Ersätt filnamnsbaserade etiketter med riktiga titlar ur RetroArchs databaser.
+
+Matchar i tur och ordning:
+  1. CRC32   - exakt, för konsol-ROM (samma summa RetroArch själv räknar ut)
+  2. rom_name - arkadset med standardnamn ("xybotsg.zip")
+  3. hoptryckt namn - arkadset med beskrivande filnamn
+     ("2020superbaseball" -> "2020 Super Baseball (NGM-030)")
+
+Utan träff behålls det städade filnamnet.
+"""
+import json, os, pathlib, re, struct, sys, zipfile, zlib
+
+RDB = pathlib.Path("/usr/share/libretro/database/rdb")
+PL = pathlib.Path.home() / ".config/retroarch/playlists"
+REPORT = pathlib.Path(
+    os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")
+) / "omarchy-retroarch" / "unmatched.json"
+
+# spellista -> databaser att slå i (flera tillåtna, första träff vinner)
+DBS = {
+    "MAME": ["MAME 2000", "MAME 2003-Plus", "MAME", "FBNeo - Arcade Games"],
+    # Neo Geo-mappen innehåller även handhållna Neo Geo Pocket-spel
+    "SNK - Neo Geo": ["FBNeo - Arcade Games", "MAME 2003-Plus", "MAME",
+                      "SNK - Neo Geo Pocket Color", "SNK - Neo Geo Pocket", "SNK - Neo Geo CD"],
+    "NEC - PC Engine - TurboGrafx 16": ["NEC - PC Engine - TurboGrafx 16",
+                                        "NEC - PC Engine SuperGrafx",
+                                        "NEC - PC Engine CD - TurboGrafx-CD"],
+    # Mapparna innehåller ofta släkt hårdvara: diskettillbehör, satellitsändningar
+    # och handhållna varianter hamnar i samma katalog som huvudsystemet.
+    "Nintendo - Nintendo Entertainment System": [
+        "Nintendo - Nintendo Entertainment System",
+        "Nintendo - Family Computer Disk System"],
+    "Nintendo - Super Nintendo Entertainment System": [
+        "Nintendo - Super Nintendo Entertainment System",
+        "Nintendo - Satellaview", "Nintendo - Sufami Turbo"],
+    "Nintendo - Nintendo 64": ["Nintendo - Nintendo 64", "Nintendo - Nintendo 64DD"],
+    "Nintendo - Nintendo DS": ["Nintendo - Nintendo DS", "Nintendo - Nintendo DSi"],
+    "Nintendo - Game Boy Advance": ["Nintendo - Game Boy Advance",
+                                    "Nintendo - Game Boy Color", "Nintendo - Game Boy",
+                                    "Nintendo - e-Reader"],
+    "Atari - 2600": ["Atari - 2600", "Atari - 5200", "Atari - 7800"],
+    "Sega - Master System - Mark III": ["Sega - Master System - Mark III",
+                                        "Sega - Game Gear", "Sega - SG-1000"],
+    "Sega - Mega Drive - Genesis": ["Sega - Mega Drive - Genesis",
+                                    "Sega - 32X", "Sega - Mega-CD - Sega CD"],
+}
+
+# --- inbäddad läsare för libretros RDB-format (RARCHDB + MessagePack) ---
+# Ligger inline med flit: verktyget ska inte bero på en fil utanför sig självt.
+import struct
+
+class R:
+    def __init__(self, b): self.b, self.i = b, 0
+    def u(self, n):
+        v = int.from_bytes(self.b[self.i:self.i+n], "big"); self.i += n; return v
+    def val(self):
+        b = self.b[self.i]; self.i += 1
+        if b <= 0x7f: return b
+        if b >= 0xe0: return b - 256
+        if 0x80 <= b <= 0x8f: return self.map(b & 0x0f)
+        if 0x90 <= b <= 0x9f: return [self.val() for _ in range(b & 0x0f)]
+        if 0xa0 <= b <= 0xbf: return self.str(b & 0x1f)
+        if b == 0xc0: return None
+        if b == 0xc2: return False
+        if b == 0xc3: return True
+        if b == 0xc4: return self.bin(self.u(1))
+        if b == 0xc5: return self.bin(self.u(2))
+        if b == 0xc6: return self.bin(self.u(4))
+        if b == 0xca: v = struct.unpack(">f", self.b[self.i:self.i+4])[0]; self.i += 4; return v
+        if b == 0xcb: v = struct.unpack(">d", self.b[self.i:self.i+8])[0]; self.i += 8; return v
+        if b in (0xcc, 0xcd, 0xce, 0xcf): return self.u(1 << (b - 0xcc))
+        if b in (0xd0, 0xd1, 0xd2, 0xd3):
+            n = 1 << (b - 0xd0); v = self.u(n)
+            return v - (1 << (8*n)) if v >= 1 << (8*n - 1) else v
+        if b == 0xd9: return self.str(self.u(1))
+        if b == 0xda: return self.str(self.u(2))
+        if b == 0xdb: return self.str(self.u(4))
+        if b == 0xdc: return [self.val() for _ in range(self.u(2))]
+        if b == 0xdd: return [self.val() for _ in range(self.u(4))]
+        if b == 0xde: return self.map(self.u(2))
+        if b == 0xdf: return self.map(self.u(4))
+        raise ValueError(f"okänd typ 0x{b:02x} vid {self.i-1}")
+    def str(self, n):
+        s = self.b[self.i:self.i+n]; self.i += n
+        return s.decode("utf-8", "replace")
+    def bin(self, n):
+        s = self.b[self.i:self.i+n]; self.i += n; return s
+    def map(self, n):
+        out = {}
+        for _ in range(n):
+            k = self.val(); out[k] = self.val()
+        return out
+
+
+def entries(path):
+    data = open(path, "rb").read()
+    assert data[:7] == b"RARCHDB", "inte en RDB-fil"
+    meta_off = int.from_bytes(data[8:16], "big")
+    r = R(data); r.i = 16
+    end = meta_off if meta_off else len(data)
+    while r.i < end:
+        try:
+            v = r.val()
+        except Exception:
+            break
+        if isinstance(v, dict) and v:
+            yield v
+# --- slut RDB-läsare ---
+
+
+def squash(s: str) -> str:
+    """Titel -> jämförnyckel. Databaserna skriver artiklar sist
+    ("American Tail, An") och paketets DS-filer har katalognummer först
+    ("2581 - Sigma Harmonics"), så båda formerna måste bort."""
+    s = re.sub(r"[\(\[].*?[\)\]]", " ", s)
+    s = re.sub(r"^\s*\d{3,5}\s*[-_.]\s*", "", s)      # katalognummer
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+ROMAN = [("viii","8"),("vii","7"),("iii","3"),("vi","6"),("iv","4"),
+         ("ix","9"),("ii","2"),("x","10"),("v","5")]
+
+
+def deroman(key: str) -> str:
+    """Databasen skriver "Alpha Mission II", filen heter "alphamission2"."""
+    for r, a in ROMAN:
+        key = re.sub(rf"(?<=[a-z]){r}(?![a-z])", a, key)
+    return key
+
+
+def squash_loose(s: str) -> str:
+    """Som squash men utan artiklar - fångar databasens omvända form
+    ("American Tail, An" mot filens "An American Tail"). Används bara som
+    reserv, eftersom den slår ihop titlar som annars är distinkta."""
+    s = re.sub(r"[\(\[].*?[\)\]]", " ", s)
+    s = re.sub(r"^\s*\d{3,5}\s*[-_.]\s*", "", s)
+    s = re.sub(r",\s*(the|a|an|los|las|el|la|le|les|der|die|das)\b", " ", s, flags=re.I)
+    s = re.sub(r"\b(the|a|an)\b", " ", s, flags=re.I)
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def crc_of(path: pathlib.Path) -> str:
+    try:
+        if path.suffix.lower() == ".zip":
+            with zipfile.ZipFile(path) as z:
+                for i in z.infolist():
+                    if not i.is_dir():
+                        return f"{i.CRC & 0xFFFFFFFF:08x}"
+        elif path.stat().st_size <= 512 * 1024 * 1024:
+            c = 0
+            with path.open("rb") as fh:
+                while chunk := fh.read(1 << 20):
+                    c = zlib.crc32(chunk, c)
+            return f"{c & 0xFFFFFFFF:08x}"
+    except Exception:
+        pass
+    return ""
+
+
+def load(names):
+    by_crc, by_rom, by_squash, by_loose = {}, {}, {}, {}
+    for n in names:
+        p = RDB / f"{n}.rdb"
+        if not p.exists():
+            continue
+        for e in entries(p):
+            name = e.get("name")
+            if not name:
+                continue
+            crc = e.get("crc")
+            if isinstance(crc, bytes):
+                by_crc.setdefault(crc.hex().lower(), name)
+            rn = e.get("rom_name")
+            if isinstance(rn, str):
+                by_rom.setdefault(rn.lower(), name)
+                by_squash.setdefault(squash(re.sub(r"\.\w+$", "", rn)), name)
+                by_loose.setdefault(squash_loose(re.sub(r"\.\w+$", "", rn)), name)
+            by_squash.setdefault(squash(name), name)
+            by_loose.setdefault(squash_loose(name), name)
+            by_loose.setdefault(deroman(squash_loose(name)), name)
+            by_loose.setdefault(deroman(squash(name)), name)
+    return by_crc, by_rom, by_squash, by_loose
+
+
+def main():
+    only = sys.argv[1].lower() if len(sys.argv) > 1 else None
+    tot = hit = 0
+    unmatched = []
+    for lpl in sorted(PL.glob("*.lpl")):
+        if lpl.stem.startswith("content_") or (only and only not in lpl.stem.lower()):
+            continue
+        data = json.loads(lpl.read_text(encoding="utf-8"))
+        by_crc, by_rom, by_squash, by_loose = load(DBS.get(lpl.stem, [lpl.stem]))
+        if not (by_crc or by_squash):
+            print(f"  {lpl.stem:<48} ingen databas")
+            continue
+        n = 0
+        for it in data["items"]:
+            p = pathlib.Path(it["path"])
+            crc = (it.get("crc32") or "").split("|")[0].lower()
+            if not crc or crc == "00000000":
+                crc = crc_of(p)
+                if crc:
+                    it["crc32"] = f"{crc.upper()}|crc"
+            key = squash(p.stem)
+            name = (by_crc.get(crc)
+                    or by_rom.get(p.name.lower())
+                    or by_squash.get(key))
+            if not name and len(key) >= 6:
+                # arkadset heter ofta "3 Count Bout / Fire Suplex (NGM-043)" i
+                # databasen men "3countbout" på disk - ta entydiga prefix
+                pre = sorted({v for k, v in by_squash.items() if k.startswith(key)})
+                if len(pre) == 1:
+                    name = pre[0]
+                elif pre and len({squash(x) for x in pre}) == 1:
+                    # flera regionvarianter av samma titel - ta den första
+                    name = pre[0]
+                elif pre:
+                    # olika titlar med samma prefix: godta ändå om alla delar
+                    # samma grundtitel fram till första skiljetecknet
+                    heads = {re.split(r"\s*[\(/]", x)[0].strip() for x in pre}
+                    if len(heads) == 1:
+                        name = pre[0]
+            if not name:
+                name = (by_loose.get(squash_loose(p.stem))
+                        or by_loose.get(deroman(squash_loose(p.stem)))
+                        or by_loose.get(deroman(key)))
+            if not name and len(key) >= 7:
+                # samma titel så när som på regionmarkör eller pluralform:
+                # "Abrams Battle Tanks (U)" mot databasens "Abrams Battle Tank"
+                cand = {v for k, v in by_squash.items()
+                        if k.startswith(key) or key.startswith(k)}
+                if len(cand) == 1:
+                    name = cand.pop()
+            if not name:
+                # skivavbilder heter ibland "CD.cue"/"DISC1.ccd"; mappnamnet
+                # bär titeln i de fallen
+                folder = squash(re.sub(r"^(PSX|PS1)\s*-\s*", "", p.parent.name))
+                if len(folder) >= 5:
+                    name = by_squash.get(folder)
+                    if not name:
+                        pre = {v for k, v in by_squash.items() if k.startswith(folder)}
+                        if len(pre) == 1:
+                            name = pre.pop()
+            if name:
+                it["label"] = name
+                it["_db"] = True
+                n += 1
+            else:
+                it.pop("_db", None)
+                unmatched.append((lpl.stem, it["label"], it["path"]))
+        # Olika regiondumpar av samma spel får samma databasnamn efter
+        # matchningen. Behåll en post per titel - okomprimerat före arkiv.
+        ARCH = {".zip", ".7z"}
+        best = {}
+        for it in data["items"]:
+            k = it["label"].lower()
+            cur = best.get(k)
+            if cur is None or (pathlib.Path(cur["path"]).suffix.lower() in ARCH
+                               and pathlib.Path(it["path"]).suffix.lower() not in ARCH):
+                best[k] = it
+        data["items"] = sorted(best.values(), key=lambda i: i["label"].lower())
+        lpl.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        # räkna efter dedupliceringen, annars jämförs olika mängder
+        n = sum(1 for i in data["items"] if i.get("_db"))
+        tot += len(data["items"]); hit += n
+        pct = 100 * n // len(data["items"]) if data["items"] else 0
+        print(f"  {lpl.stem:<48} {n:>5}/{len(data['items'])} ({pct}%)", flush=True)
+    import json as _j
+    REPORT.parent.mkdir(parents=True, exist_ok=True)
+    _j.dump(unmatched, open(REPORT, "w"))
+    print(f"\n  {hit}/{tot} riktiga titlar ({100*hit//tot if tot else 0}%)")
+
+
+if __name__ == "__main__":
+    main()
